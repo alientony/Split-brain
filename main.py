@@ -31,7 +31,7 @@ def main():
         
         # Training configuration
         "train_batch_size": 1,
-        "eval_batch_size": 4,
+        "eval_batch_size": 1,
         "learning_rate": 5e-5,
         "epochs": 3,
         "patience": 2,
