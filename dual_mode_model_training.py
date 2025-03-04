@@ -430,7 +430,196 @@ class DualDecoderModel(nn.Module):
                 "logits2": logits2,
                 "mode": detected_mode
             }
-
+    def generate_dual(self, input_ids1, input_ids2, tokenizer1, tokenizer2, 
+                     max_length=100, temperature=1.0, do_sample=True, 
+                     attention_mask1=None, attention_mask2=None,
+                     return_attention_maps=False):
+        """
+        Generate responses leveraging the fusion mechanism between two models.
+        
+        Args:
+            input_ids1: Input tokens for model1 [batch_size, seq_len]
+            input_ids2: Input tokens for model2 [batch_size, seq_len]
+            tokenizer1: Tokenizer for model1
+            tokenizer2: Tokenizer for model2
+            max_length: Maximum number of new tokens to generate
+            temperature: Sampling temperature (1.0 = no change, <1.0 = more focused, >1.0 = more random)
+            do_sample: Whether to use sampling vs greedy decoding
+            attention_mask1: Attention mask for model1
+            attention_mask2: Attention mask for model2
+            return_attention_maps: Whether to return attention maps for visualization
+            
+        Returns:
+            Tuple containing:
+            - List of generated sequences from model1
+            - List of generated sequences from model2
+            - (Optional) Attention maps if return_attention_maps is True
+        """
+        self.eval()
+        batch_size = input_ids1.size(0)
+        
+        # Move inputs to the correct devices
+        input_ids1 = input_ids1.to(self.device1)
+        input_ids2 = input_ids2.to(self.device2)
+        
+        # Initialize tracking variables
+        current_ids1 = input_ids1.clone()
+        current_ids2 = input_ids2.clone()
+        
+        # Create attention masks if not provided
+        if attention_mask1 is None:
+            attention_mask1 = torch.ones_like(current_ids1, device=self.device1)
+        else:
+            attention_mask1 = attention_mask1.to(self.device1)
+        
+        if attention_mask2 is None:
+            attention_mask2 = torch.ones_like(current_ids2, device=self.device2)
+        else:
+            attention_mask2 = attention_mask2.to(self.device2)
+            
+        # Track which sequences have finished generating
+        finished1 = torch.zeros(batch_size, dtype=torch.bool, device=self.fusion_device)
+        finished2 = torch.zeros(batch_size, dtype=torch.bool, device=self.fusion_device)
+        
+        # Determine if inputs are identical (for mode detection)
+        inputs_match = torch.equal(input_ids1.cpu(), input_ids2.cpu()) if input_ids1.size() == input_ids2.size() else False
+        mode = "single" if inputs_match else "multi"
+        
+        # For storing attention maps if requested
+        attention_maps = [] if return_attention_maps else None
+        
+        # Add gate projection layers if they don't exist yet
+        if not hasattr(self, 'gate1_proj'):
+            self.gate1_proj = nn.Linear(self.fusion_layer.fusion_output_dim, self.vocab_size1).to(self.fusion_device)
+        
+        if not hasattr(self, 'gate2_proj'):
+            self.gate2_proj = nn.Linear(self.fusion_layer.fusion_output_dim, self.vocab_size2).to(self.fusion_device)
+        
+        with torch.no_grad():
+            # Generation loop
+            for step in range(max_length):
+                # Run forward pass
+                outputs = self.forward(
+                    input_ids1=current_ids1, 
+                    input_ids2=current_ids2, 
+                    attention_mask1=attention_mask1, 
+                    attention_mask2=attention_mask2,
+                    mode=mode,
+                    return_details=True  # Always get full details for generation
+                )
+                
+                # Store attention maps if requested
+                if return_attention_maps:
+                    attention_maps.append({
+                        "attn1_2": outputs["attn1_2"].detach().cpu(),
+                        "attn2_1": outputs["attn2_1"].detach().cpu(),
+                    })
+                
+                # Extract logits and gates
+                fused_logits = outputs["fused_logits"]
+                logits1 = outputs["logits1"]
+                logits2 = outputs["logits2"]
+                gate1 = outputs["gate1"]
+                gate2 = outputs["gate2"]
+                detected_mode = outputs["mode"]
+                
+                # Get only the last token logits for generation
+                fused_logits_last = fused_logits[:, -1, :].to(self.fusion_device)
+                logits1_last = logits1[:, -1, :].to(self.fusion_device)
+                logits2_last = logits2[:, -1, :].to(self.fusion_device)
+                
+                # Apply the same weighting scheme as in training based on mode
+                if detected_mode == "single":
+                    # In single-task mode, the fused representation is more important
+                    weighted_logits1 = 0.5 * fused_logits_last + 0.5 * logits1_last
+                    weighted_logits2 = 0.5 * fused_logits_last + 0.5 * logits2_last
+                else:
+                    # In multi-task mode, the separate decoders are more important
+                    weighted_logits1 = 0.3 * fused_logits_last + 0.7 * logits1_last
+                    weighted_logits2 = 0.3 * fused_logits_last + 0.7 * logits2_last
+                
+                # Apply gating - use the gates from the last token position
+                gate1_last = gate1[:, -1, :].to(self.fusion_device)
+                gate2_last = gate2[:, -1, :].to(self.fusion_device)
+                
+                # Project gates to vocabulary space
+                gate1_proj = self.gate1_proj(gate1_last)  # [batch_size, vocab_size1]
+                gate2_proj = self.gate2_proj(gate2_last)  # [batch_size, vocab_size2]
+                
+                # Apply sigmoid to ensure values are between 0 and 1
+                gate1_proj = torch.sigmoid(gate1_proj)
+                gate2_proj = torch.sigmoid(gate2_proj)
+                
+                # Apply projected gates to logits
+                weighted_logits1 = weighted_logits1 * gate1_proj  # Element-wise multiplication
+                weighted_logits2 = weighted_logits2 * gate2_proj  # Element-wise multiplication
+                
+                # Apply temperature
+                if temperature != 1.0:
+                    weighted_logits1 = weighted_logits1 / temperature
+                    weighted_logits2 = weighted_logits2 / temperature
+                
+                # Apply sampling or greedy decoding
+                if do_sample:
+                    # Handle any NaN/Inf values
+                    weighted_logits1 = torch.nan_to_num(weighted_logits1)
+                    weighted_logits2 = torch.nan_to_num(weighted_logits2)
+                    
+                    # Apply softmax for sampling
+                    probs1 = torch.softmax(weighted_logits1, dim=-1)
+                    probs2 = torch.softmax(weighted_logits2, dim=-1)
+                    
+                    # Sample
+                    next_tokens1 = torch.multinomial(probs1, num_samples=1).squeeze(-1)
+                    next_tokens2 = torch.multinomial(probs2, num_samples=1).squeeze(-1)
+                else:
+                    # Greedy decoding
+                    next_tokens1 = torch.argmax(weighted_logits1, dim=-1)
+                    next_tokens2 = torch.argmax(weighted_logits2, dim=-1)
+                
+                # Update finished status based on EOS tokens
+                finished1 = finished1 | (next_tokens1 == tokenizer1.eos_token_id)
+                finished2 = finished2 | (next_tokens2 == tokenizer2.eos_token_id)
+                
+                # Only update tokens for sequences that aren't finished
+                next_tokens1 = next_tokens1.masked_fill(finished1, tokenizer1.pad_token_id)
+                next_tokens2 = next_tokens2.masked_fill(finished2, tokenizer2.pad_token_id)
+                
+                # Move tokens to appropriate devices
+                next_tokens1 = next_tokens1.to(self.device1)
+                next_tokens2 = next_tokens2.to(self.device2)
+                
+                # Add next tokens to sequences
+                current_ids1 = torch.cat([current_ids1, next_tokens1.unsqueeze(-1)], dim=-1)
+                current_ids2 = torch.cat([current_ids2, next_tokens2.unsqueeze(-1)], dim=-1)
+                
+                # Update attention masks
+                attention_mask1 = torch.cat([
+                    attention_mask1, 
+                    (~finished1).to(self.device1).long().unsqueeze(-1)
+                ], dim=-1)
+                
+                attention_mask2 = torch.cat([
+                    attention_mask2, 
+                    (~finished2).to(self.device2).long().unsqueeze(-1)
+                ], dim=-1)
+                
+                # Break if all sequences are finished
+                if torch.all(finished1) and torch.all(finished2):
+                    break
+                    
+        # Move tensors to CPU for decoding
+        current_ids1_cpu = current_ids1.detach().cpu()
+        current_ids2_cpu = current_ids2.detach().cpu()
+                
+        # Decode sequences
+        decoded_texts1 = tokenizer1.batch_decode(current_ids1_cpu, skip_special_tokens=True)
+        decoded_texts2 = tokenizer2.batch_decode(current_ids2_cpu, skip_special_tokens=True)
+        
+        if return_attention_maps:
+            return decoded_texts1, decoded_texts2, attention_maps
+        else:
+            return decoded_texts1, decoded_texts2
 # ----- Training Function -----
 
 def train_dual_model(model, train_dataloader, val_dataloader, optimizer, 
@@ -799,6 +988,10 @@ def create_dual_decoder_model(config, tokenizer1, tokenizer2):
 
 
 # ----- Example Queries -----
+
+
+
+
 
 def run_example_queries(model, tokenizer1, tokenizer2, device_map=None):
     """
