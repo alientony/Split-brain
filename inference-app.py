@@ -27,7 +27,8 @@ class DualModelInferenceApp:
         print("Loading tokenizers...")
         self.tokenizer1 = AutoTokenizer.from_pretrained(self.config["model_dir1"])
         self.tokenizer2 = AutoTokenizer.from_pretrained(self.config["model_dir2"])
-        
+        print(self.tokenizer1)
+        print(self.tokenizer2)
         # Set up model with inverted GPU allocation
         print("Setting up models with inverted GPU allocation...")
         self.dual_model = self.load_dual_model()
@@ -36,13 +37,18 @@ class DualModelInferenceApp:
         self.device_map = {
             'model1': 'cuda:1',
             'model2': 'cuda:0',
-            'fusion': 'cuda:0'
+            'fusion': 'cuda:0',
+            'extra': 'cuda:1'  # Add extra device for balancing
         }
         
         # Move model components to their devices for inference
         self.dual_model.model1.to(self.device_map['model1'])
         self.dual_model.model2.to(self.device_map['model2'])
         self.dual_model.fusion_layer.to(self.device_map['fusion'])
+        
+        # Move LM heads to appropriate devices
+        self.dual_model.fused_lm_head1.to(self.device_map['fusion'])  # Keep on fusion device
+        self.dual_model.fused_lm_head2.to(self.device_map['fusion'])  # IMPORTANT: Keep on same device as fused tensor
         self.dual_model.lm_head1.to(self.device_map['fusion'])
         self.dual_model.lm_head2.to(self.device_map['fusion'])
         
@@ -50,10 +56,11 @@ class DualModelInferenceApp:
         print(f"Model1 (Qwen) on {next(self.dual_model.model1.parameters()).device}")
         print(f"Model2 (Llama) on {next(self.dual_model.model2.parameters()).device}")
         print(f"Fusion on {next(self.dual_model.fusion_layer.parameters()).device}")
+        print(f"Fused LM head 1 on {self.dual_model.fused_lm_head1.weight.device}")
+        print(f"Fused LM head 2 on {self.dual_model.fused_lm_head2.weight.device}")
         
         # Set to evaluation mode
         self.dual_model.eval()
-    
     
     def load_dual_model(self):
         """Load the dual decoder model and trained weights"""
@@ -64,7 +71,8 @@ class DualModelInferenceApp:
         device_map = {
             'model1': 'cuda:1',  # First model on GPU 1
             'model2': 'cuda:0',  # Second model on GPU 0
-            'fusion': 'cuda:0'   # Fusion layer on GPU 0
+            'fusion': 'cuda:0',  # Fusion layer on GPU 0
+            'extra': 'cuda:1'    # Extra device for balancing
         }
         
         # Load base models with explicit device placement
@@ -103,14 +111,26 @@ class DualModelInferenceApp:
                     print("Warning: Unexpected checkpoint format, trying to load directly...")
                     state_dict = checkpoint
                 
+                # Load components
                 if 'fusion_layer' in state_dict:
                     dual_model.fusion_layer.load_state_dict(state_dict['fusion_layer'])
                 if 'proj1' in state_dict:
                     dual_model.proj1.load_state_dict(state_dict['proj1'])
                 if 'proj2' in state_dict:
                     dual_model.proj2.load_state_dict(state_dict['proj2'])
-                if 'fused_lm_head' in state_dict:
-                    dual_model.fused_lm_head.load_state_dict(state_dict['fused_lm_head'])
+                
+                # Handle both new and old checkpoint formats
+                if 'fused_lm_head1' in state_dict and 'fused_lm_head2' in state_dict:
+                    # New format with dual heads
+                    dual_model.fused_lm_head1.load_state_dict(state_dict['fused_lm_head1'])
+                    dual_model.fused_lm_head2.load_state_dict(state_dict['fused_lm_head2'])
+                    print("Loaded dual fused heads from checkpoint")
+                elif 'fused_lm_head' in state_dict:
+                    # Old format with single head - only load to fused_lm_head1
+                    dual_model.fused_lm_head1.load_state_dict(state_dict['fused_lm_head'])
+                    # Initialize fused_lm_head2 with random weights
+                    print("Using old checkpoint format - initializing second fused head with random weights")
+                
                 if 'lm_head1' in state_dict:
                     dual_model.lm_head1.load_state_dict(state_dict['lm_head1'])
                 if 'lm_head2' in state_dict:
@@ -139,11 +159,17 @@ class DualModelInferenceApp:
             return text, other_text
     
     def generate_dual_streaming(self, input_ids1, input_ids2, tokenizer1, tokenizer2, 
-                                max_length=100, temperature=0.7, do_sample=True, 
-                                attention_mask1=None, attention_mask2=None,
-                                return_attention_maps=False, seed=None, feed_mode="default"):
+                            max_length=100, temperature=0.7, do_sample=True, 
+                            attention_mask1=None, attention_mask2=None,
+                            return_attention_maps=False, seed=None, feed_mode="default"):
         """Generation function that yields intermediate outputs for streaming with seed and feed mode control."""
         self.dual_model.eval()
+        
+        # For token logging
+        token_log1 = []
+        token_log2 = []
+        token_text_log1 = []
+        token_text_log2 = []
         
         # Set initial seed if provided
         if seed is not None:
@@ -200,14 +226,14 @@ class DualModelInferenceApp:
             self.dual_model.gate1_proj = torch.nn.Linear(
                 self.dual_model.fusion_layer.fusion_output_dim, 
                 self.dual_model.vocab_size1
-            ).to(self.device_map['fusion'])
+            ).to(self.device_map['fusion'])  # Put on fusion device
         
         if not hasattr(self.dual_model, 'gate2_proj'):
             print("Creating gate projection layer for model 2")
             self.dual_model.gate2_proj = torch.nn.Linear(
                 self.dual_model.fusion_layer.fusion_output_dim, 
                 self.dual_model.vocab_size2
-            ).to(self.device_map['fusion'])
+            ).to(self.device_map['fusion'])  # Put on fusion device
         
         start_time = time.time()
         for step in range(max_length):
@@ -226,9 +252,13 @@ class DualModelInferenceApp:
                     torch.cuda.manual_seed_all(step_seed)
             
             with torch.no_grad():
+                # Initialize next_token variables early to ensure they exist
+                next_token1 = None
+                next_token2 = None
+                
                 try:
                     if step > 0 and (attention_mask1.size(1) != current_ids1.size(1) or 
-                                     attention_mask2.size(1) != current_ids2.size(1)):
+                                    attention_mask2.size(1) != current_ids2.size(1)):
                         print(f"Warning: Attention mask mismatch at step {step}")
                         attention_mask1 = torch.ones_like(current_ids1, device=self.device_map['model1'])
                         attention_mask2 = torch.ones_like(current_ids2, device=self.device_map['model2'])
@@ -286,6 +316,7 @@ class DualModelInferenceApp:
                             yield current_text1, current_text2, f"Generation failed at step {step}: {str(e)}"
                             return
                 
+                # Move hidden states to fusion device for processing
                 hidden1 = hidden1.to(self.device_map['fusion'])
                 hidden2 = hidden2.to(self.device_map['fusion'])
                 
@@ -319,114 +350,148 @@ class DualModelInferenceApp:
                     mode=mode
                 )
                 
-                fused = fusion_outputs["fused"]
-                out1 = fusion_outputs["out1"]
-                out2 = fusion_outputs["out2"]
-                gate1 = fusion_outputs["gate1"]
-                gate2 = fusion_outputs["gate2"]
-                
-                fused_logits = self.dual_model.fused_lm_head(fused)
+                # Extract all representations
+                fused = fusion_outputs["fused"]  # On fusion device
+                out1 = fusion_outputs["out1"]    # On fusion device
+                out2 = fusion_outputs["out2"]    # On fusion device
+                gate1 = fusion_outputs["gate1"]  # On fusion device
+                gate2 = fusion_outputs["gate2"]  # On fusion device
+
+                # Generate logits using different heads - UPDATED for balanced approach
+                # Now all these operations happen on the fusion device
+                fused_logits1 = self.dual_model.fused_lm_head1(fused)  # Uses model1's vocabulary
+                fused_logits2 = self.dual_model.fused_lm_head2(fused)  # Uses model2's vocabulary
                 logits1 = self.dual_model.lm_head1(out1)
                 logits2 = self.dual_model.lm_head2(out2)
                 
-                # Ensure correct dimensions first (fix the dimension issue):
-                fused_logits_last = fused_logits[:, -1, :] if len(fused_logits.shape) > 2 else fused_logits
+                # Get only the last token's logits
+                fused_logits1_last = fused_logits1[:, -1, :] if len(fused_logits1.shape) > 2 else fused_logits1
+                fused_logits2_last = fused_logits2[:, -1, :] if len(fused_logits2.shape) > 2 else fused_logits2
                 logits1_last = logits1[:, -1, :] if len(logits1.shape) > 2 else logits1
                 logits2_last = logits2[:, -1, :] if len(logits2.shape) > 2 else logits2
-
-                # Get Llama's vocab size
-                vocab_size2 = logits2_last.size(-1)  # Should be 128256
-
-                # Trim the fused_logits to match Llama's vocabulary size
-                fused_logits_for_model2 = fused_logits_last[:, :vocab_size2]
-
-                # Add diagnostic log to verify trimming
-                if step == 0:  # Only print for first step
-                    print(f"Trimmed fused_logits for model2: {fused_logits_for_model2.shape}")
-
-                # Now apply the weighting with the trimmed tensor
-                if mode == "single":
-                    # Model1 weighting remains the same
-                    weighted_logits1 = (1.0 * fused_logits_last + 0.3 * logits1_last) / 1.3
-                    
-                    # Model2 now gets fused representation access
-                    weighted_logits2 = (0.5 * fused_logits_for_model2 + 0.5 * logits2_last) / 1.0
-                else:
-                    # Multi-task mode
-                    weighted_logits1 = (0.2 * fused_logits_last + 0.4 * logits1_last) / 0.6
-                    weighted_logits2 = (0.3 * fused_logits_for_model2 + 0.7 * logits2_last) / 1.0
                 
+                # Debug shapes in first step
                 if step == 0:
                     print(f"Last token logits shapes:")
-                    print(f"  fused_logits_last: {fused_logits_last.shape}")
+                    print(f"  fused_logits1_last: {fused_logits1_last.shape}")
+                    print(f"  fused_logits2_last: {fused_logits2_last.shape}")
                     print(f"  logits1_last: {logits1_last.shape}")
                     print(f"  logits2_last: {logits2_last.shape}")
                 
+                # Clean up any extra dimensions
                 if len(logits1_last.shape) > 2:
                     logits1_last = logits1_last.squeeze(1)
                 if len(logits2_last.shape) > 2:
                     logits2_last = logits2_last.squeeze(1)
                 
+                # Apply weighted combination based on mode
                 if mode == "single":
-                    weighted_logits1 = (1.0 * fused_logits_last + 0.3 * logits1_last) / 1.3
-                    weighted_logits2 = logits2_last
+                    # In single-task mode, fused representation is more important
+                    weighted_logits1 = (0.7 * fused_logits1_last + 0.3 * logits1_last) / 1.0
+                    weighted_logits2 = (0.7 * fused_logits2_last + 0.3 * logits2_last) / 1.0
                 else:
-                    weighted_logits1 = (0.2 * fused_logits_last + 0.4 * logits1_last) / 0.6
-                    weighted_logits2 = logits2_last
+                    # In multi-task mode, separate decoders are more important
+                    weighted_logits1 = (0.4 * fused_logits1_last + 0.6 * logits1_last) / 1.0
+                    weighted_logits2 = (0.4 * fused_logits2_last + 0.6 * logits2_last) / 1.0
                 
+                # Clean up any extra dimensions again
                 if len(weighted_logits1.shape) > 2:
                     weighted_logits1 = weighted_logits1.squeeze(1)
                 if len(weighted_logits2.shape) > 2:
                     weighted_logits2 = weighted_logits2.squeeze(1)
                 
+                # Apply temperature scaling
                 if temperature > 0:
                     weighted_logits1 = weighted_logits1 / temperature
                     weighted_logits2 = weighted_logits2 / temperature
                 
+                # Debug info in first step
                 if step == 0:
                     print(f"Mode: {mode}")
-                    print(f"Vocab sizes - fused: {fused_logits_last.size(-1)}, logits1: {logits1_last.size(-1)}, logits2: {logits2_last.size(-1)}")
-                    print(f"Using normalized weights for model1 - {'1.0 fused + 0.3 model1' if mode == 'single' else '0.2 fused + 0.4 model1'}")
+                    print(f"Using balanced weighting for both models")
+                    print(f"Vocab sizes - model1: {weighted_logits1.size(-1)}, model2: {weighted_logits2.size(-1)}")
                 
-                if do_sample:
+                # Sampling or greedy decoding - all on fusion device
+                if do_sample and temperature > 0:  # Only sample if temperature > 0
                     if step == 0:
                         print(f"Logits shapes before softmax - model1: {weighted_logits1.shape}, model2: {weighted_logits2.shape}")
+                    
+                    # Fix NaN values
                     weighted_logits1 = torch.nan_to_num(weighted_logits1)
                     weighted_logits2 = torch.nan_to_num(weighted_logits2)
                     
+                    # Ensure 2D shape for softmax: [batch_size, vocab_size]
                     if len(weighted_logits1.shape) == 1:
                         weighted_logits1 = weighted_logits1.unsqueeze(0)
                     if len(weighted_logits2.shape) == 1:
                         weighted_logits2 = weighted_logits2.unsqueeze(0)
-                    
+
+                    # Apply softmax
                     probs1 = torch.softmax(weighted_logits1, dim=-1)
                     probs2 = torch.softmax(weighted_logits2, dim=-1)
-                    
-                    if step == 0:
+
+                    # Check shapes at first step
+                    if step == 1:
                         print(f"Probs shapes - model1: {probs1.shape}, model2: {probs2.shape}")
                         print(f"Probs1 sum: {probs1.sum().item()}, has NaN: {torch.isnan(probs1).any().item()}")
-                    
-                    if len(probs1.shape) > 2:
-                        probs1 = probs1[:, -1, :]
-                        print(f"Fixed probs1 shape to: {probs1.shape}")
-                    if len(probs2.shape) > 2:
-                        probs2 = probs2[:, -1, :]
-                        print(f"Fixed probs2 shape to: {probs2.shape}")
-                    
+                        print(f"Probs2 sum: {probs2.sum().item()}, has NaN: {torch.isnan(probs2).any().item()}")
+                    # CRITICAL FIX: Handle multi-dimensional tensors correctly
+                    # If we have shape [batch, seq, vocab], we want to process batches separately
+                    if len(probs1.shape) == 3:
+                        batch_size, seq_len, vocab_size = probs1.shape
+                        # We only want to sample from the last token position for each item in the batch
+                        probs1_last = probs1[:, -1, :]  # Shape becomes [batch, vocab]
+                        print(f"Taking last token from sequence for probs1: {probs1_last.shape}")
+                    else:
+                        probs1_last = probs1
+
+                    if len(probs2.shape) == 3:
+                        batch_size, seq_len, vocab_size = probs2.shape
+                        probs2_last = probs2[:, -1, :]  # Shape becomes [batch, vocab]
+                        print(f"Taking last token from sequence for probs2: {probs2_last.shape}")
+                    else:
+                        probs2_last = probs2
+
+                    # Ensure exactly 2D shape for multinomial - [batch, vocab]
+                    if len(probs1_last.shape) == 1:
+                        probs1_last = probs1_last.unsqueeze(0)
+                    if len(probs2_last.shape) == 1:
+                        probs2_last = probs2_last.unsqueeze(0)
+
+                    # Sample tokens
                     try:
-                        next_token1 = torch.multinomial(probs1, num_samples=1)
-                        next_token2 = torch.multinomial(probs2, num_samples=1)
+                        next_token1 = torch.multinomial(probs1_last, num_samples=1)
+                        next_token2 = torch.multinomial(probs2_last, num_samples=1)
+                        
+                        if step == 0:
+                            print(f"Sampled token shapes - token1: {next_token1.shape}, token2: {next_token2.shape}")
                     except RuntimeError as e:
                         print(f"Error during sampling: {e}")
-                        print(f"probs1 min: {probs1.min().item()}, max: {probs1.max().item()}")
-                        print(f"probs2 min: {probs2.min().item()}, max: {probs2.max().item()}")
                         print("Falling back to greedy decoding")
-                        next_token1 = torch.argmax(weighted_logits1, dim=-1, keepdim=True)
-                        next_token2 = torch.argmax(weighted_logits2, dim=-1, keepdim=True)
-                else:
-                    next_token1 = torch.argmax(weighted_logits1, dim=-1, keepdim=True)
-                    next_token2 = torch.argmax(weighted_logits2, dim=-1, keepdim=True)
+                        # Fall through to greedy decoding below
+                        do_sample = False
                 
+                # Greedy decoding if sampling is disabled or if sampling failed
+                if not do_sample or temperature <= 0 or next_token1 is None:
+                    # For greedy decoding, also handle 3D tensors properly
+                    if len(weighted_logits1.shape) == 3:
+                        weighted_logits1_last = weighted_logits1[:, -1, :]
+                    else:
+                        weighted_logits1_last = weighted_logits1
+                        
+                    if len(weighted_logits2.shape) == 3:
+                        weighted_logits2_last = weighted_logits2[:, -1, :]
+                    else:
+                        weighted_logits2_last = weighted_logits2
+                        
+                    next_token1 = torch.argmax(weighted_logits1_last, dim=-1, keepdim=True)
+                    next_token2 = torch.argmax(weighted_logits2_last, dim=-1, keepdim=True)
+                    
+                    if step == 0:
+                        print("Using greedy decoding")
+                        print(f"Greedy token shapes - token1: {next_token1.shape}, token2: {next_token2.shape}")
+                
+                # Restore random state if seed is set
                 if seed is not None:
                     random.setstate(py_state)
                     np.random.set_state(np_state)
@@ -434,18 +499,29 @@ class DualModelInferenceApp:
                     if torch.cuda.is_available():
                         torch.cuda.set_rng_state_all(cuda_rng_state)
                 
+                # Ensure tokens have the right shape
                 if len(next_token1.shape) > 2:
                     next_token1 = next_token1.view(next_token1.size(0), -1)
                 if len(next_token2.shape) > 2:
                     next_token2 = next_token2.view(next_token2.size(0), -1)
                 
+                # Record tokens for logging
+                token_id1 = next_token1[0].item()
+                token_id2 = next_token2[0].item()
+                token_log1.append(token_id1)
+                token_log2.append(token_id2)
+                
+                # Move tokens to their respective devices for the next step
                 next_token1 = next_token1.to(self.device_map['model1'])
                 next_token2 = next_token2.to(self.device_map['model2'])
                 
                 # Decode tokens for display
                 token_text1 = tokenizer1.decode(next_token1[0], skip_special_tokens=True)
                 token_text2 = tokenizer2.decode(next_token2[0], skip_special_tokens=True)
+                token_text_log1.append(token_text1)
+                token_text_log2.append(token_text2)
                 
+                # Special handling for model2 tokens
                 if not token_text2 or token_text2.isspace() or token_text2.startswith("<"):
                     token_text2 = tokenizer2.decode(next_token2[0], skip_special_tokens=False)
                     if not token_text2 or token_text2.isspace():
@@ -483,22 +559,42 @@ class DualModelInferenceApp:
                     # For current_ids2, use next_token1 from model1 but move it to device_map['model2']
                     current_ids2 = torch.cat([current_ids2, next_token1.to(self.device_map['model2'])], dim=1)
                 
+                # Update attention masks
                 new_mask1 = torch.ones(current_ids1.size(0), 1, device=self.device_map['model1'])
                 new_mask2 = torch.ones(current_ids2.size(0), 1, device=self.device_map['model2'])
                 attention_mask1 = torch.cat([attention_mask1, new_mask1], dim=1)
                 attention_mask2 = torch.cat([attention_mask2, new_mask2], dim=1)
                 
+                # Print the first 20 tokens as they are generated
+                if step < 20:
+                    print(f"Step {step+1}:")
+                    print(f"  Model1 token: {token_id1} -> '{token_text1}'")
+                    print(f"  Model2 token: {token_id2} -> '{token_text2}'")
+                
+                # Show progress
                 elapsed = time.time() - start_time
                 tokens_generated = step + 1
                 speed = tokens_generated / elapsed if elapsed > 0 else 0.0
                 status = f"Step {step+1}/{max_length} - Generating... ({elapsed:.2f}s, {speed:.2f} tokens/sec)"
                 
+                # Yield current result
                 yield current_text1, current_text2, status
                 
-                eos1 = (next_token1 == tokenizer1.eos_token_id).any()
-                eos2 = (next_token2 == tokenizer2.eos_token_id).any()
+                # Check for EOS tokens
+                eos1 = (next_token1 == tokenizer1.eos_token_id).any() if hasattr(tokenizer1, "eos_token_id") and tokenizer1.eos_token_id is not None else False
+                eos2 = (next_token2 == tokenizer2.eos_token_id).any() if hasattr(tokenizer2, "eos_token_id") and tokenizer2.eos_token_id is not None else False
                 if eos1 and eos2:
                     break
+        
+        # Print a summary of the tokens at the end
+        print("\nToken Generation Summary:")
+        print("Model 1 (Qwen) First 20 Tokens:")
+        for i, (token_id, token_text) in enumerate(zip(token_log1[:20], token_text_log1[:20])):
+            print(f"  {i+1}: {token_id} -> '{token_text}'")
+        
+        print("\nModel 2 (Llama) First 20 Tokens:")
+        for i, (token_id, token_text) in enumerate(zip(token_log2[:20], token_text_log2[:20])):
+            print(f"  {i+1}: {token_id} -> '{token_text}'")
         
         yield current_text1, current_text2, f"Generation completed in {time.time()-start_time:.2f} seconds"
     
@@ -602,7 +698,7 @@ def main():
         "model_dir1": "./DeepSeek-R1-Distill-Qwen-1.5B",
         "model_dir2": "./Llama-3.2-1B",
         "fusion_output_dim": 2048,
-        "checkpoint_path": "./model_outputs/dual_model_best.pt"
+        "checkpoint_path": "./model_outputs/checkpoint_epoch_3.pt"
     }
     
     inference_app = DualModelInferenceApp(config["checkpoint_path"], config)
@@ -611,4 +707,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
