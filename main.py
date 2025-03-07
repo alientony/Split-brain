@@ -27,14 +27,14 @@ def main():
         # Model configuration
         "fusion_output_dim": 2048,  # Larger fusion layer for cross-attention
         "freeze_base_models": True,
-        "max_length": 1600,
+        "max_length": 1000,
         
         # Training configuration
         "train_batch_size": 1,
         "eval_batch_size": 1,
         "learning_rate": 5e-5,
         "epochs": 3,
-        "patience": 2,
+        "patience": 15,
         "accumulation_steps": 16,
         "train_val_split": 0.8,
         "seed": 42,
@@ -109,6 +109,8 @@ def main():
         train_dataloader=train_dataloader,
         val_dataloader=val_dataloader,
         optimizer=optimizer,
+        tokenizer1=tokenizer1,  
+        tokenizer2=tokenizer2,  
         epochs=config["epochs"],
         patience=config["patience"],
         accumulation_steps=config["accumulation_steps"],
